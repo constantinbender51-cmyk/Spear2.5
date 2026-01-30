@@ -25,8 +25,8 @@ RISK_FREE_RATE = 0.0
 MAX_ASSETS_TO_OPTIMIZE = 1 # Limit the number of assets processed by GA
 
 # Costs
-TRANSACTION_FEE = 0.002 # 0.2% per order
-SLIPPAGE = 0.00        # 0.3% price impact per order
+TRANSACTION_FEE = 0.00 # 0.2% per trade (entry and exit)
+SLIPPAGE = 0.00        # 0.2% price slippage
 
 # Ranges
 STOP_PCT_RANGE = (0.001, 0.02)   # 0.1% to 2%
@@ -122,7 +122,7 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
     equity = 10000.0
     equity_curve = [equity]
     position = 0          # 0: Flat, 1: Long, -1: Short
-    entry_price = 0.0
+    entry_price = 0.0     # This will store the actual execution price (with slippage)
     
     trades = []
     hourly_log = []
@@ -172,7 +172,7 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
         if position != 0:
             sl_hit = False
             tp_hit = False
-            trigger_price = 0.0
+            raw_exit_price = 0.0
             reason = ""
 
             if position == 1: # Long Logic
@@ -181,10 +181,10 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
                 
                 # Check Low for SL first (Conservative Assumption)
                 if current_l <= sl_price:
-                    sl_hit = True; trigger_price = sl_price 
+                    sl_hit = True; raw_exit_price = sl_price 
                 # Check High for TP
                 elif current_h >= tp_price:
-                    tp_hit = True; trigger_price = tp_price
+                    tp_hit = True; raw_exit_price = tp_price
 
             elif position == -1: # Short Logic
                 sl_price = entry_price * (1 + stop_pct)
@@ -192,84 +192,87 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
                 
                 # Check High for SL first (Conservative Assumption)
                 if current_h >= sl_price:
-                    sl_hit = True; trigger_price = sl_price
+                    sl_hit = True; raw_exit_price = sl_price
                 # Check Low for TP
                 elif current_l <= tp_price:
-                    tp_hit = True; trigger_price = tp_price
+                    tp_hit = True; raw_exit_price = tp_price
             
             if sl_hit or tp_hit:
-                # Apply Slippage on Exit
+                # Apply Slippage to Exit
+                filled_exit_price = 0.0
                 if position == 1:
-                    executed_exit = trigger_price * (1 - SLIPPAGE)
-                    pn_l = (executed_exit - entry_price) / entry_price
+                    filled_exit_price = raw_exit_price * (1 - SLIPPAGE) # Sell lower
                 else:
-                    executed_exit = trigger_price * (1 + SLIPPAGE)
-                    pn_l = (entry_price - executed_exit) / entry_price
+                    filled_exit_price = raw_exit_price * (1 + SLIPPAGE) # Buy higher
+
+                # Calculate Net PnL (Linear Pairs)
+                # PnL% = (Price_Diff / Entry) - Entry_Fee - Exit_Fee_in_Entry_Terms
+                # Accurate formula for linear compounding:
+                # Long PnL% = (Exit/Entry - 1) - Fee * (1 + Exit/Entry)
+                # Short PnL% = (1 - Exit/Entry) - Fee * (1 + Exit/Entry)
                 
-                # Deduct Fees (Entry + Exit)
-                pn_l -= (TRANSACTION_FEE * 2)
+                ratio = filled_exit_price / entry_price
+                
+                if position == 1:
+                    pn_l = (ratio - 1) - TRANSACTION_FEE * (1 + ratio)
+                else:
+                    pn_l = (1 - ratio) - TRANSACTION_FEE * (1 + ratio)
                 
                 equity *= (1 + pn_l)
                 reason = "SL" if sl_hit else "TP"
-                trades.append({'time': ts, 'type': 'Exit', 'price': executed_exit, 'pnl': pn_l, 'equity': equity, 'reason': reason})
+                trades.append({'time': ts, 'type': 'Exit', 'price': filled_exit_price, 'pnl': pn_l, 'equity': equity, 'reason': reason})
                 position = 0
                 trades_completed += 1
                 equity_curve.append(equity)
                 continue 
 
         if position == 0:
-            # Detect Short signal: Price went ABOVE prev_c to hit a line (wick up)
-            # Detect Long signal: Price went BELOW prev_c to hit a line (wick down)
-            
+            # Detect Entry Signals
             found_short = False
-            short_price = 0.0
+            short_target = 0.0
             
-            # Check for lines between prev_c and current_h (Short Candidates)
             if current_h > prev_c:
-                idx_s = np.searchsorted(lines, prev_c, side='right')   # First line > prev_c
-                idx_e = np.searchsorted(lines, current_h, side='right') # Lines <= current_h
+                idx_s = np.searchsorted(lines, prev_c, side='right')
+                idx_e = np.searchsorted(lines, current_h, side='right')
                 potential_shorts = lines[idx_s:idx_e]
                 
                 if len(potential_shorts) > 0:
                     found_short = True
-                    short_price = potential_shorts[0] # The line closest to prev_c (first crossed going up)
+                    short_target = potential_shorts[0]
 
             found_long = False
-            long_price = 0.0
+            long_target = 0.0
             
-            # Check for lines between current_l and prev_c (Long Candidates)
             if current_l < prev_c:
-                idx_s = np.searchsorted(lines, current_l, side='left') # First line >= current_l
-                idx_e = np.searchsorted(lines, prev_c, side='left')    # Lines < prev_c
+                idx_s = np.searchsorted(lines, current_l, side='left')
+                idx_e = np.searchsorted(lines, prev_c, side='left')
                 potential_longs = lines[idx_s:idx_e]
                 
                 if len(potential_longs) > 0:
                     found_long = True
-                    long_price = potential_longs[-1] # The line closest to prev_c (first crossed going down)
+                    long_target = potential_longs[-1]
 
-            # Execution Decision
             target_line = 0.0
             new_pos = 0
             
-            # If both directions triggered (Outside Bar), assume direction of the Close
             if found_short and found_long:
                 if current_c > prev_c:
-                    new_pos = -1; target_line = short_price
+                    new_pos = -1; target_line = short_target
                 else:
-                    new_pos = 1; target_line = long_price
+                    new_pos = 1; target_line = long_target
             elif found_short:
-                new_pos = -1; target_line = short_price
+                new_pos = -1; target_line = short_target
             elif found_long:
-                new_pos = 1; target_line = long_price
+                new_pos = 1; target_line = long_target
             
             if new_pos != 0:
                 position = new_pos
-                # Apply Slippage on Entry
+                # Apply Slippage to Entry
                 if position == 1:
-                    entry_price = target_line * (1 + SLIPPAGE)
+                    entry_price = target_line * (1 + SLIPPAGE) # Buy higher
                 else:
-                    entry_price = target_line * (1 - SLIPPAGE)
-                    
+                    entry_price = target_line * (1 - SLIPPAGE) # Sell lower
+                
                 trades.append({'time': ts, 'type': 'Short' if position == -1 else 'Long', 'price': entry_price, 'pnl': 0, 'equity': equity, 'reason': 'Entry'})
 
         equity_curve.append(equity)
@@ -323,7 +326,7 @@ def generate_report(symbol, best_ind, train_data, test_data, train_curve, test_c
     
     # 1. Equity Curve
     plt.subplot(2, 1, 1)
-    plt.title(f"{symbol} Equity Curve: Training (Blue) vs Test (Orange) [Net of Fees/Slip]")
+    plt.title(f"{symbol} Equity Curve: Training (Blue) vs Test (Orange)")
     plt.plot(train_curve, label='Training Equity')
     plt.plot(range(len(train_curve), len(train_curve)+len(test_curve)), test_curve, label='Test Equity')
     plt.legend()
@@ -367,8 +370,7 @@ def generate_report(symbol, best_ind, train_data, test_data, train_curve, test_c
     <ul class="list-group">
         <li class="list-group-item"><strong>Stop Loss:</strong> {best_ind[0]*100:.4f}%</li>
         <li class="list-group-item"><strong>Take Profit:</strong> {best_ind[1]*100:.4f}%</li>
-        <li class="list-group-item"><strong>Transaction Fee:</strong> {TRANSACTION_FEE*100:.2f}% per order</li>
-        <li class="list-group-item"><strong>Slippage:</strong> {SLIPPAGE*100:.2f}% per order</li>
+        <li class="list-group-item"><strong>Fee / Slip:</strong> {TRANSACTION_FEE*100:.2f}% / {SLIPPAGE*100:.2f}%</li>
         <li class="list-group-item"><strong>Active Grid Lines:</strong> {N_LINES}</li>
         <li class="list-group-item"><a href="/api/parameters?symbol={symbol}" target="_blank">View JSON Parameters</a></li>
     </ul>
@@ -528,7 +530,7 @@ def live_trading_daemon(symbol, pair, best_ind, initial_equity, start_price, tra
         if live_position != 0:
             sl_hit = False
             tp_hit = False
-            trigger_price = 0.0
+            raw_exit_price = 0.0
             reason = ""
 
             if live_position == 1:
@@ -537,10 +539,10 @@ def live_trading_daemon(symbol, pair, best_ind, initial_equity, start_price, tra
                 
                 # Check Low for SL first
                 if current_l <= sl_price:
-                    sl_hit = True; trigger_price = sl_price
+                    sl_hit = True; raw_exit_price = sl_price
                 # Check High for TP
                 elif current_h >= tp_price:
-                    tp_hit = True; trigger_price = tp_price
+                    tp_hit = True; raw_exit_price = tp_price
                     
             elif live_position == -1:
                 sl_price = live_entry_price * (1 + stop_pct)
@@ -548,26 +550,29 @@ def live_trading_daemon(symbol, pair, best_ind, initial_equity, start_price, tra
                 
                 # Check High for SL first
                 if current_h >= sl_price:
-                    sl_hit = True; trigger_price = sl_price
+                    sl_hit = True; raw_exit_price = sl_price
                 # Check Low for TP
                 elif current_l <= tp_price:
-                    tp_hit = True; trigger_price = tp_price
+                    tp_hit = True; raw_exit_price = tp_price
             
             if sl_hit or tp_hit:
-                # Apply Slippage on Exit
+                # Apply Slippage to Exit
+                filled_exit_price = 0.0
                 if live_position == 1:
-                    executed_exit = trigger_price * (1 - SLIPPAGE)
-                    pn_l = (executed_exit - live_entry_price) / live_entry_price
+                    filled_exit_price = raw_exit_price * (1 - SLIPPAGE)
                 else:
-                    executed_exit = trigger_price * (1 + SLIPPAGE)
-                    pn_l = (live_entry_price - executed_exit) / live_entry_price
-                
-                # Deduct Fees
-                pn_l -= (TRANSACTION_FEE * 2)
+                    filled_exit_price = raw_exit_price * (1 + SLIPPAGE)
 
+                # Net PnL Calculation
+                ratio = filled_exit_price / live_entry_price
+                if live_position == 1:
+                    pn_l = (ratio - 1) - TRANSACTION_FEE * (1 + ratio)
+                else:
+                    pn_l = (1 - ratio) - TRANSACTION_FEE * (1 + ratio)
+                
                 live_equity *= (1 + pn_l)
                 reason = "SL" if sl_hit else "TP"
-                live_trades.append({'time': ts, 'type': 'Exit', 'price': executed_exit, 'pnl': pn_l, 'equity': live_equity, 'reason': reason})
+                live_trades.append({'time': ts, 'type': 'Exit', 'price': filled_exit_price, 'pnl': pn_l, 'equity': live_equity, 'reason': reason})
                 live_position = 0
                 
                 prev_close = current_c
@@ -576,9 +581,9 @@ def live_trading_daemon(symbol, pair, best_ind, initial_equity, start_price, tra
                 continue
 
         if live_position == 0:
-            # === CHANGED: Use High/Low for Entry Detection ===
+            # Entry Logic
             found_short = False
-            short_price = 0.0
+            short_target = 0.0
             
             if current_h > prev_close:
                 idx_s = np.searchsorted(lines, prev_close, side='right')
@@ -586,10 +591,10 @@ def live_trading_daemon(symbol, pair, best_ind, initial_equity, start_price, tra
                 potential_shorts = lines[idx_s:idx_e]
                 if len(potential_shorts) > 0:
                     found_short = True
-                    short_price = potential_shorts[0]
+                    short_target = potential_shorts[0]
 
             found_long = False
-            long_price = 0.0
+            long_target = 0.0
             
             if current_l < prev_close:
                 idx_s = np.searchsorted(lines, current_l, side='left')
@@ -597,29 +602,29 @@ def live_trading_daemon(symbol, pair, best_ind, initial_equity, start_price, tra
                 potential_longs = lines[idx_s:idx_e]
                 if len(potential_longs) > 0:
                     found_long = True
-                    long_price = potential_longs[-1]
+                    long_target = potential_longs[-1]
 
             target_line = 0.0
             new_pos = 0
             
             if found_short and found_long:
                 if current_c > prev_close:
-                    new_pos = -1; target_line = short_price
+                    new_pos = -1; target_line = short_target
                 else:
-                    new_pos = 1; target_line = long_price
+                    new_pos = 1; target_line = long_target
             elif found_short:
-                new_pos = -1; target_line = short_price
+                new_pos = -1; target_line = short_target
             elif found_long:
-                new_pos = 1; target_line = long_price
+                new_pos = 1; target_line = long_target
                 
             if new_pos != 0:
                 live_position = new_pos
-                # Apply Slippage on Entry
+                # Apply Slippage to Entry
                 if live_position == 1:
                     live_entry_price = target_line * (1 + SLIPPAGE)
                 else:
                     live_entry_price = target_line * (1 - SLIPPAGE)
-
+                
                 live_trades.append({'time': ts, 'type': 'Short' if live_position == -1 else 'Long', 'price': live_entry_price, 'pnl': 0, 'equity': live_equity, 'reason': 'Entry'})
 
         prev_close = current_c
