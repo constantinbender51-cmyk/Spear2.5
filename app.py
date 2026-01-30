@@ -25,8 +25,8 @@ RISK_FREE_RATE = 0.0
 MAX_ASSETS_TO_OPTIMIZE = 1 # Limit the number of assets processed by GA
 
 # Costs
-TRANSACTION_FEE = 0.002  # 0.2% per order
-SLIPPAGE = 0.003         # 0.3% price impact per order
+TRANSACTION_FEE = 0.00  # 0.2% per order
+SLIPPAGE = 0.00        # 0.3% price impact per order
 
 # Ranges
 STOP_PCT_RANGE = (0.001, 0.02)   # 0.1% to 2%
