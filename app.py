@@ -18,19 +18,19 @@ from deap import base, creator, tools, algorithms
 # --- Configuration ---
 BASE_DATA_URL = "https://ohlcendpoint.up.railway.app/data"
 PORT = 8080
-N_LINES = 32
+N_LINES = 64
 POPULATION_SIZE = 320
-GENERATIONS = 10
+GENERATIONS = 20
 RISK_FREE_RATE = 0.0
 MAX_ASSETS_TO_OPTIMIZE = 1 # Limit the number of assets processed by GA
 
 # Costs
 TRANSACTION_FEE = 0.002 # 0.2% per trade (entry and exit)
-SLIPPAGE = 0.00        # 0.2% price slippage
+SLIPPAGE = 0.002       # 0.2% price slippage
 
 # Ranges
-STOP_PCT_RANGE = (0.001, 0.02)   # 0.1% to 2%
-PROFIT_PCT_RANGE = (0.0004, 0.05) # 0.04% to 5%
+STOP_PCT_RANGE = (0.000, 0.02)   # 0.1% to 2%
+PROFIT_PCT_RANGE = (0.0004, 0.1) # 0.04% to 5%
 
 warnings.filterwarnings("ignore")
 
