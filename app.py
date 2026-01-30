@@ -29,7 +29,7 @@ TRANSACTION_FEE = 0.002  # 0.2% per order
 SLIPPAGE = 0.003         # 0.3% price impact per order
 
 # Ranges
-STOP_PCT_RANGE = (0, 0.02)   # 0.1% to 2%
+STOP_PCT_RANGE = (0.001, 0.02)   # 0.1% to 2%
 PROFIT_PCT_RANGE = (0.0004, 0.05) # 0.04% to 5%
 
 warnings.filterwarnings("ignore")
@@ -491,4 +491,273 @@ def live_trading_daemon(symbol, pair, best_ind, initial_equity, start_price, tra
         ts, current_h, current_l, current_c = fetch_binance_candle(pair)
         
         if current_c is None:
-            print(f"[{symbol}] Failed to fetch da
+            print(f"[{symbol}] Failed to fetch data. Skipping.")
+            continue
+            
+        print(f"[{symbol}] Processing {ts} Close: {current_c}")
+        
+        idx = np.searchsorted(lines, current_c)
+        val_below = lines[idx-1] if idx > 0 else -999.0
+        val_above = lines[idx] if idx < len(lines) else 999999.0
+        
+        act_sl = np.nan
+        act_tp = np.nan
+        pos_str = "FLAT"
+        
+        if live_position == 1:
+            pos_str = "LONG"
+            act_sl = live_entry_price * (1 - stop_pct)
+            act_tp = live_entry_price * (1 + profit_pct)
+        elif live_position == -1:
+            pos_str = "SHORT"
+            act_sl = live_entry_price * (1 + stop_pct)
+            act_tp = live_entry_price * (1 - profit_pct)
+            
+        log_entry = {
+            "Timestamp": str(ts),
+            "Price": f"{current_c:.2f}",
+            "Nearest Below": f"{val_below:.2f}" if val_below != -999 else "None",
+            "Nearest Above": f"{val_above:.2f}" if val_above != 999999 else "None",
+            "Position": pos_str,
+            "Active SL": f"{act_sl:.2f}" if not np.isnan(act_sl) else "-",
+            "Active TP": f"{act_tp:.2f}" if not np.isnan(act_tp) else "-",
+            "Equity": f"{live_equity:.2f}"
+        }
+        live_logs.append(log_entry)
+        
+        if live_position != 0:
+            sl_hit = False
+            tp_hit = False
+            trigger_price = 0.0
+            reason = ""
+
+            if live_position == 1:
+                sl_price = live_entry_price * (1 - stop_pct)
+                tp_price = live_entry_price * (1 + profit_pct)
+                
+                # Check Low for SL first
+                if current_l <= sl_price:
+                    sl_hit = True; trigger_price = sl_price
+                # Check High for TP
+                elif current_h >= tp_price:
+                    tp_hit = True; trigger_price = tp_price
+                    
+            elif live_position == -1:
+                sl_price = live_entry_price * (1 + stop_pct)
+                tp_price = live_entry_price * (1 - profit_pct)
+                
+                # Check High for SL first
+                if current_h >= sl_price:
+                    sl_hit = True; trigger_price = sl_price
+                # Check Low for TP
+                elif current_l <= tp_price:
+                    tp_hit = True; trigger_price = tp_price
+            
+            if sl_hit or tp_hit:
+                # Apply Slippage on Exit
+                if live_position == 1:
+                    executed_exit = trigger_price * (1 - SLIPPAGE)
+                    pn_l = (executed_exit - live_entry_price) / live_entry_price
+                else:
+                    executed_exit = trigger_price * (1 + SLIPPAGE)
+                    pn_l = (live_entry_price - executed_exit) / live_entry_price
+                
+                # Deduct Fees
+                pn_l -= (TRANSACTION_FEE * 2)
+
+                live_equity *= (1 + pn_l)
+                reason = "SL" if sl_hit else "TP"
+                live_trades.append({'time': ts, 'type': 'Exit', 'price': executed_exit, 'pnl': pn_l, 'equity': live_equity, 'reason': reason})
+                live_position = 0
+                
+                prev_close = current_c
+                with REPORT_LOCK:
+                    HTML_REPORTS[symbol] = generate_report(symbol, best_ind, train_df, test_df, train_curve, test_curve, test_trades, hourly_log, live_logs, live_trades)
+                continue
+
+        if live_position == 0:
+            # === CHANGED: Use High/Low for Entry Detection ===
+            found_short = False
+            short_price = 0.0
+            
+            if current_h > prev_close:
+                idx_s = np.searchsorted(lines, prev_close, side='right')
+                idx_e = np.searchsorted(lines, current_h, side='right')
+                potential_shorts = lines[idx_s:idx_e]
+                if len(potential_shorts) > 0:
+                    found_short = True
+                    short_price = potential_shorts[0]
+
+            found_long = False
+            long_price = 0.0
+            
+            if current_l < prev_close:
+                idx_s = np.searchsorted(lines, current_l, side='left')
+                idx_e = np.searchsorted(lines, prev_close, side='left')
+                potential_longs = lines[idx_s:idx_e]
+                if len(potential_longs) > 0:
+                    found_long = True
+                    long_price = potential_longs[-1]
+
+            target_line = 0.0
+            new_pos = 0
+            
+            if found_short and found_long:
+                if current_c > prev_close:
+                    new_pos = -1; target_line = short_price
+                else:
+                    new_pos = 1; target_line = long_price
+            elif found_short:
+                new_pos = -1; target_line = short_price
+            elif found_long:
+                new_pos = 1; target_line = long_price
+                
+            if new_pos != 0:
+                live_position = new_pos
+                # Apply Slippage on Entry
+                if live_position == 1:
+                    live_entry_price = target_line * (1 + SLIPPAGE)
+                else:
+                    live_entry_price = target_line * (1 - SLIPPAGE)
+
+                live_trades.append({'time': ts, 'type': 'Short' if live_position == -1 else 'Long', 'price': live_entry_price, 'pnl': 0, 'equity': live_equity, 'reason': 'Entry'})
+
+        prev_close = current_c
+        with REPORT_LOCK:
+            HTML_REPORTS[symbol] = generate_report(symbol, best_ind, train_df, test_df, train_curve, test_curve, test_trades, hourly_log, live_logs, live_trades)
+
+# --- 7. Server Handler ---
+class ResultsHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        parsed_path = urllib.parse.urlparse(self.path)
+        path = parsed_path.path
+        query = urllib.parse.parse_qs(parsed_path.query)
+
+        if path == '/api/parameters':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            symbol = query.get('symbol', [None])[0]
+            if symbol and symbol in BEST_PARAMS:
+                self.wfile.write(json.dumps(BEST_PARAMS[symbol]).encode('utf-8'))
+            else:
+                self.wfile.write(json.dumps(BEST_PARAMS).encode('utf-8'))
+                
+        elif path.startswith('/report/'):
+            symbol = path.split('/')[-1]
+            if symbol in HTML_REPORTS:
+                self.send_response(200)
+                self.send_header('Content-type', 'text/html')
+                self.end_headers()
+                with REPORT_LOCK:
+                    self.wfile.write(HTML_REPORTS[symbol].encode('utf-8'))
+            else:
+                self.send_error(404, "Report not found for symbol")
+                
+        elif path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            
+            # Dashboard Index
+            links = ""
+            for asset in ASSETS:
+                sym = asset['symbol']
+                if sym in HTML_REPORTS:
+                    links += f'<a href="/report/{sym}" class="list-group-item list-group-item-action">{sym} Strategy Report</a>'
+                else:
+                    links += f'<div class="list-group-item list-group-item-light">{sym} (Initializing...)</div>'
+            
+            dashboard = f"""
+            <html>
+            <head>
+                <title>Multi-Asset Grid Bot</title>
+                <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css">
+                <meta http-equiv="refresh" content="30">
+            </head>
+            <body class="p-5">
+                <h1>Active Grid Strategies</h1>
+                <div class="list-group mt-4">
+                    {links}
+                </div>
+            </body>
+            </html>
+            """
+            self.wfile.write(dashboard.encode('utf-8'))
+        else:
+            self.send_error(404)
+
+# --- 8. Main Execution Loop ---
+def process_asset(asset_config):
+    sym = asset_config['symbol']
+    csv = asset_config['csv']
+    pair = asset_config['pair']
+    
+    print(f"\n--- Starting Optimization for {sym} ---")
+    
+    # 1. Get Data
+    train_df, test_df = get_data(csv)
+    if train_df is None:
+        print(f"Skipping {sym} due to data error.")
+        return
+
+    # 2. Setup GA
+    min_p, max_p = train_df['close'].min(), train_df['close'].max()
+    toolbox = setup_toolbox(min_p, max_p, train_df)
+
+    # 3. Run GA
+    pop = toolbox.population(n=POPULATION_SIZE)
+    hof = tools.HallOfFame(1)
+    stats = tools.Statistics(lambda ind: ind.fitness.values)
+    stats.register("avg", np.mean)
+    stats.register("max", np.max)
+    
+    print(f"[{sym}] Evolving...")
+    algorithms.eaSimple(pop, toolbox, cxpb=0.5, mutpb=0.2, ngen=GENERATIONS, stats=stats, halloffame=hof, verbose=False)
+    
+    best_ind = hof[0]
+    print(f"[{sym}] Best Sharpe: {best_ind.fitness.values[0]:.4f}")
+
+    # 4. Save Params
+    BEST_PARAMS[sym] = {
+        "stop_percent": best_ind[0],
+        "profit_percent": best_ind[1],
+        "line_prices": list(best_ind[2:])
+    }
+
+    # 5. Final Tests
+    train_curve, _, _ = run_backtest(train_df, best_ind[0], best_ind[1], np.array(best_ind[2:]), detailed_log_trades=0)
+    test_curve, test_trades, hourly_log = run_backtest(test_df, best_ind[0], best_ind[1], np.array(best_ind[2:]), detailed_log_trades=5)
+    
+    # 6. Generate Initial Report
+    with REPORT_LOCK:
+        HTML_REPORTS[sym] = generate_report(sym, best_ind, train_df, test_df, train_curve, test_curve, test_trades, hourly_log)
+
+    # 7. Start Live Thread
+    last_test_close = test_df['close'].iloc[-1]
+    t = threading.Thread(
+        target=live_trading_daemon, 
+        args=(sym, pair, best_ind, 10000.0, last_test_close, train_df, test_df, train_curve, test_curve, test_trades, hourly_log),
+        daemon=True
+    )
+    t.start()
+    print(f"[{sym}] Live thread launched.")
+
+if __name__ == "__main__":
+    print("Initializing Multi-Asset Grid System...")
+    
+    # Process assets sequentially for GA to avoid massive CPU contention,
+    # then spawn threads for live waiting.
+    
+    # --- Limit number of assets processed based on Global config ---
+    assets_to_process = ASSETS[:MAX_ASSETS_TO_OPTIMIZE]
+    
+    for asset in assets_to_process:
+        process_asset(asset)
+    
+    print("\nAll assets processed. Starting Web Server...")
+    print(f"Serving Dashboard at http://localhost:{PORT}/")
+    
+    with socketserver.TCPServer(("", PORT), ResultsHandler) as httpd:
+        try: httpd.serve_forever()
+        except KeyboardInterrupt: httpd.server_close()
