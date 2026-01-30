@@ -22,14 +22,14 @@ N_LINES = 32
 POPULATION_SIZE = 320
 GENERATIONS = 10
 RISK_FREE_RATE = 0.0
-MAX_ASSETS_TO_OPTIMIZE = 15  # Limit the number of assets processed by GA
+MAX_ASSETS_TO_OPTIMIZE = 1 # Limit the number of assets processed by GA
 
 # Costs
 TRANSACTION_FEE = 0.002  # 0.2% per order
 SLIPPAGE = 0.003         # 0.3% price impact per order
 
 # Ranges
-STOP_PCT_RANGE = (0.001, 0.02)   # 0.1% to 2%
+STOP_PCT_RANGE = (0, 0.02)   # 0.1% to 2%
 PROFIT_PCT_RANGE = (0.0004, 0.05) # 0.04% to 5%
 
 warnings.filterwarnings("ignore")
