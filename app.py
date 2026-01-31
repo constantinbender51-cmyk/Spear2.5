@@ -22,7 +22,7 @@ N_LINES = 32
 POPULATION_SIZE = 320
 GENERATIONS = 10
 RISK_FREE_RATE = 0.0
-MAX_ASSETS_TO_OPTIMIZE = 1 # Limit the number of assets processed by GA
+MAX_ASSETS_TO_OPTIMIZE = 1  # Limit the number of assets processed by GA
 
 # Ranges
 STOP_PCT_RANGE = (0.001, 0.02)   # 0.1% to 2%
@@ -84,8 +84,6 @@ def get_data(csv_filename):
         print(f"[{csv_filename}] Raw 1m Data: {len(df)} rows")
 
         # Keeping 1H resampling for GA Optimization speed
-        # The live bot will run on 1m, but we optimize on 1H to avoid 
-        # waiting hours for the script to start.
         df_1h = df.resample('1h').agg({
             'open': 'first',
             'high': 'max',
@@ -108,8 +106,8 @@ def get_data(csv_filename):
         print(f"CRITICAL DATA ERROR for {csv_filename}: {e}")
         return None, None
 
-# --- 3. Strategy Logic ---
-def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0, fee_pct=0.0, slippage_pct=0.0):
+# --- 3. Strategy Logic (Multi-Trade Support) ---
+def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0):
     closes = df['close'].values
     highs = df['high'].values
     lows = df['low'].values
@@ -117,8 +115,9 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0, fee_pct
     
     equity = 10000.0
     equity_curve = [equity]
-    position = 0          # 0: Flat, 1: Long, -1: Short
-    entry_price = 0.0
+    
+    # List of dictionaries: {'type': 1 or -1, 'entry': float, 'sl': float, 'tp': float}
+    open_trades = []
     
     trades = []
     hourly_log = []
@@ -139,18 +138,9 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0, fee_pct
             val_below = lines[idx-1] if idx > 0 else -999.0
             val_above = lines[idx] if idx < len(lines) else 999999.0
             
-            act_sl = np.nan
-            act_tp = np.nan
-            pos_str = "FLAT"
-            
-            if position == 1:
-                pos_str = "LONG"
-                act_sl = entry_price * (1 - stop_pct)
-                act_tp = entry_price * (1 + profit_pct)
-            elif position == -1:
-                pos_str = "SHORT"
-                act_sl = entry_price * (1 + stop_pct)
-                act_tp = entry_price * (1 - profit_pct)
+            long_count = sum(1 for t in open_trades if t['type'] == 1)
+            short_count = sum(1 for t in open_trades if t['type'] == -1)
+            pos_str = f"L: {long_count} | S: {short_count}"
             
             log_entry = {
                 "Timestamp": str(ts),
@@ -158,117 +148,102 @@ def run_backtest(df, stop_pct, profit_pct, lines, detailed_log_trades=0, fee_pct
                 "Nearest Below": f"{val_below:.2f}" if val_below != -999 else "None",
                 "Nearest Above": f"{val_above:.2f}" if val_above != 999999 else "None",
                 "Position": pos_str,
-                "Active SL": f"{act_sl:.2f}" if not np.isnan(act_sl) else "-",
-                "Active TP": f"{act_tp:.2f}" if not np.isnan(act_tp) else "-",
+                "Active SL": "Multiple" if len(open_trades) > 0 else "-",
+                "Active TP": "Multiple" if len(open_trades) > 0 else "-",
                 "Equity": f"{equity:.2f}"
             }
             hourly_log.append(log_entry)
 
-        # --- Strategy Execution ---
-        if position != 0:
+        # --- 1. Process Exits (Multi-Trade) ---
+        remaining_trades = []
+        for trade in open_trades:
             sl_hit = False
             tp_hit = False
             exit_price = 0.0
-            reason = ""
-
-            if position == 1: # Long Logic
-                sl_price = entry_price * (1 - stop_pct)
-                tp_price = entry_price * (1 + profit_pct)
-                
-                # Check Low for SL first (Conservative Assumption)
-                if current_l <= sl_price:
-                    sl_hit = True; exit_price = sl_price 
+            
+            if trade['type'] == 1: # Long
+                # Check Low for SL
+                if current_l <= trade['sl']:
+                    sl_hit = True; exit_price = trade['sl']
                 # Check High for TP
-                elif current_h >= tp_price:
-                    tp_hit = True; exit_price = tp_price
-
-            elif position == -1: # Short Logic
-                sl_price = entry_price * (1 + stop_pct)
-                tp_price = entry_price * (1 - profit_pct)
-                
-                # Check High for SL first (Conservative Assumption)
-                if current_h >= sl_price:
-                    sl_hit = True; exit_price = sl_price
+                elif current_h >= trade['tp']:
+                    tp_hit = True; exit_price = trade['tp']
+            
+            elif trade['type'] == -1: # Short
+                # Check High for SL
+                if current_h >= trade['sl']:
+                    sl_hit = True; exit_price = trade['sl']
                 # Check Low for TP
-                elif current_l <= tp_price:
-                    tp_hit = True; exit_price = tp_price
+                elif current_l <= trade['tp']:
+                    tp_hit = True; exit_price = trade['tp']
             
             if sl_hit or tp_hit:
-                # Apply Slippage to Execution Prices
-                # Entry (past) adjusted for simulation
-                # Exit (current) adjusted for simulation
-                
-                if position == 1: 
-                    exec_entry = entry_price * (1 + slippage_pct)
-                    exec_exit = exit_price * (1 - slippage_pct)
-                    gross_pnl = (exec_exit - exec_entry) / exec_entry
+                if trade['type'] == 1: 
+                    pn_l = (exit_price - trade['entry']) / trade['entry']
                 else: 
-                    exec_entry = entry_price * (1 - slippage_pct)
-                    exec_exit = exit_price * (1 + slippage_pct)
-                    gross_pnl = (exec_entry - exec_exit) / exec_entry
+                    pn_l = (trade['entry'] - exit_price) / trade['entry']
                 
-                # Apply Fee to Equity (compounded)
-                # Formula: Final = Initial * (1 + Gross_PnL) * (1 - fee) * (1 - fee)
-                net_pnl = ((1 + gross_pnl) * (1 - fee_pct) * (1 - fee_pct)) - 1
-                
-                equity *= (1 + net_pnl)
+                equity *= (1 + pn_l)
                 reason = "SL" if sl_hit else "TP"
-                trades.append({'time': ts, 'type': 'Exit', 'price': exit_price, 'pnl': net_pnl, 'equity': equity, 'reason': reason})
-                position = 0
+                trades.append({
+                    'time': ts, 
+                    'type': 'Exit', 
+                    'price': exit_price, 
+                    'pnl': pn_l, 
+                    'equity': equity, 
+                    'reason': reason
+                })
                 trades_completed += 1
-                equity_curve.append(equity)
-                continue 
+            else:
+                remaining_trades.append(trade)
+        
+        open_trades = remaining_trades
 
-        if position == 0:
-            # === CHANGED: Use High/Low for Entry Detection ===
-            # Detect Short signal: Price went ABOVE prev_c to hit a line (wick up)
-            # Detect Long signal: Price went BELOW prev_c to hit a line (wick down)
-            
-            found_short = False
-            short_price = 0.0
-            
-            # Check for lines between prev_c and current_h (Short Candidates)
-            if current_h > prev_c:
-                idx_s = np.searchsorted(lines, prev_c, side='right')   # First line > prev_c
-                idx_e = np.searchsorted(lines, current_h, side='right') # Lines <= current_h
-                potential_shorts = lines[idx_s:idx_e]
-                
-                if len(potential_shorts) > 0:
-                    found_short = True
-                    short_price = potential_shorts[0] # The line closest to prev_c (first crossed going up)
+        # --- 2. Process Entries (Pyramiding/Hedging Allowed) ---
+        found_short = False
+        short_price = 0.0
+        
+        # Check for lines between prev_c and current_h (Short Candidates)
+        if current_h > prev_c:
+            idx_s = np.searchsorted(lines, prev_c, side='right')
+            idx_e = np.searchsorted(lines, current_h, side='right')
+            potential_shorts = lines[idx_s:idx_e]
+            if len(potential_shorts) > 0:
+                found_short = True
+                short_price = potential_shorts[0]
 
-            found_long = False
-            long_price = 0.0
-            
-            # Check for lines between current_l and prev_c (Long Candidates)
-            if current_l < prev_c:
-                idx_s = np.searchsorted(lines, current_l, side='left') # First line >= current_l
-                idx_e = np.searchsorted(lines, prev_c, side='left')    # Lines < prev_c
-                potential_longs = lines[idx_s:idx_e]
-                
-                if len(potential_longs) > 0:
-                    found_long = True
-                    long_price = potential_longs[-1] # The line closest to prev_c (first crossed going down)
+        found_long = False
+        long_price = 0.0
+        
+        # Check for lines between current_l and prev_c (Long Candidates)
+        if current_l < prev_c:
+            idx_s = np.searchsorted(lines, current_l, side='left')
+            idx_e = np.searchsorted(lines, prev_c, side='left')
+            potential_longs = lines[idx_s:idx_e]
+            if len(potential_longs) > 0:
+                found_long = True
+                long_price = potential_longs[-1]
 
-            # Execution Decision
-            target_line = 0.0
-            new_pos = 0
-            
-            # If both directions triggered (Outside Bar), assume direction of the Close
-            if found_short and found_long:
-                if current_c > prev_c:
-                    new_pos = -1; target_line = short_price
-                else:
-                    new_pos = 1; target_line = long_price
-            elif found_short:
-                new_pos = -1; target_line = short_price
-            elif found_long:
-                new_pos = 1; target_line = long_price
-            
-            if new_pos != 0:
-                position = new_pos
-                entry_price = target_line
-                trades.append({'time': ts, 'type': 'Short' if position == -1 else 'Long', 'price': entry_price, 'pnl': 0, 'equity': equity, 'reason': 'Entry'})
+        # Execute Entries (Independent - can open both Long and Short in same candle)
+        if found_short:
+            entry_price = short_price
+            open_trades.append({
+                'type': -1,
+                'entry': entry_price,
+                'sl': entry_price * (1 + stop_pct),
+                'tp': entry_price * (1 - profit_pct)
+            })
+            trades.append({'time': ts, 'type': 'Short', 'price': entry_price, 'pnl': 0, 'equity': equity, 'reason': 'Entry'})
+
+        if found_long:
+            entry_price = long_price
+            open_trades.append({
+                'type': 1,
+                'entry': entry_price,
+                'sl': entry_price * (1 - stop_pct),
+                'tp': entry_price * (1 + profit_pct)
+            })
+            trades.append({'time': ts, 'type': 'Long', 'price': entry_price, 'pnl': 0, 'equity': equity, 'reason': 'Entry'})
 
         equity_curve.append(equity)
 
@@ -302,7 +277,6 @@ def evaluate_genome(individual, df_train):
     stop_pct = np.clip(individual[0], STOP_PCT_RANGE[0], STOP_PCT_RANGE[1])
     profit_pct = np.clip(individual[1], PROFIT_PCT_RANGE[0], PROFIT_PCT_RANGE[1])
     lines = np.array(individual[2:])
-    # Training runs without fees to encourage pattern finding, as per user logic/implication of request
     eq_curve, _, _ = run_backtest(df_train, stop_pct, profit_pct, lines, detailed_log_trades=0)
     return (calculate_sharpe(eq_curve),)
 
@@ -383,7 +357,7 @@ def generate_report(symbol, best_ind, train_data, test_data, train_curve, test_c
     <body>
         <div class="container-fluid">
             <a href="/" class="btn btn-secondary mb-3">&larr; Back to Dashboard</a>
-            <h1 class="mb-4">{symbol} Grid Strategy GA Results</h1>
+            <h1 class="mb-4">{symbol} Grid Strategy GA Results (Multi-Trade Enabled)</h1>
             <div class="row">
                 <div class="col-md-4">{params_html}</div>
                 <div class="col-md-8 text-right">
@@ -435,7 +409,7 @@ def fetch_binance_candle(symbol_pair):
         url = "https://api.binance.com/api/v3/klines"
         params = {
             'symbol': symbol_pair,
-            'interval': '1m', # CHANGED TO 1 MINUTE
+            'interval': '1m', 
             'limit': 2 
         }
         r = requests.get(url, params=params, timeout=10)
@@ -460,8 +434,9 @@ def live_trading_daemon(symbol, pair, best_ind, initial_equity, start_price, tra
     lines = np.sort(np.array(best_ind[2:]))
     
     live_equity = initial_equity
-    live_position = 0 
-    live_entry_price = 0.0
+    # New Multi-Trade Structure
+    live_trades_active = [] # List of dicts
+    
     prev_close = start_price
     
     live_logs = []
@@ -480,7 +455,6 @@ def live_trading_daemon(symbol, pair, best_ind, initial_equity, start_price, tra
             next_run += timedelta(minutes=1)
             
         sleep_sec = (next_run - now).total_seconds()
-        # Add tiny random jitter to avoid exact sync
         sleep_sec += random.uniform(0.1, 1.0)
         
         time.sleep(sleep_sec)
@@ -497,118 +471,117 @@ def live_trading_daemon(symbol, pair, best_ind, initial_equity, start_price, tra
         val_below = lines[idx-1] if idx > 0 else -999.0
         val_above = lines[idx] if idx < len(lines) else 999999.0
         
-        act_sl = np.nan
-        act_tp = np.nan
-        pos_str = "FLAT"
+        long_count = sum(1 for t in live_trades_active if t['type'] == 1)
+        short_count = sum(1 for t in live_trades_active if t['type'] == -1)
+        pos_str = f"L: {long_count} | S: {short_count}"
         
-        if live_position == 1:
-            pos_str = "LONG"
-            act_sl = live_entry_price * (1 - stop_pct)
-            act_tp = live_entry_price * (1 + profit_pct)
-        elif live_position == -1:
-            pos_str = "SHORT"
-            act_sl = live_entry_price * (1 + stop_pct)
-            act_tp = live_entry_price * (1 - profit_pct)
-            
         log_entry = {
             "Timestamp": str(ts),
             "Price": f"{current_c:.2f}",
             "Nearest Below": f"{val_below:.2f}" if val_below != -999 else "None",
             "Nearest Above": f"{val_above:.2f}" if val_above != 999999 else "None",
             "Position": pos_str,
-            "Active SL": f"{act_sl:.2f}" if not np.isnan(act_sl) else "-",
-            "Active TP": f"{act_tp:.2f}" if not np.isnan(act_tp) else "-",
+            "Active SL": "Multiple" if len(live_trades_active) > 0 else "-",
+            "Active TP": "Multiple" if len(live_trades_active) > 0 else "-",
             "Equity": f"{live_equity:.2f}"
         }
         live_logs.append(log_entry)
         
-        if live_position != 0:
+        # --- Live Exit Logic (Multi-Trade) ---
+        remaining_live = []
+        trades_exited = False
+        
+        for trade in live_trades_active:
             sl_hit = False
             tp_hit = False
             exit_price = 0.0
-            reason = ""
-
-            if live_position == 1:
-                sl_price = live_entry_price * (1 - stop_pct)
-                tp_price = live_entry_price * (1 + profit_pct)
-                
-                # Check Low for SL first
-                if current_l <= sl_price:
-                    sl_hit = True; exit_price = sl_price
-                # Check High for TP
-                elif current_h >= tp_price:
-                    tp_hit = True; exit_price = tp_price
+            
+            if trade['type'] == 1:
+                if current_l <= trade['sl']:
+                    sl_hit = True; exit_price = trade['sl']
+                elif current_h >= trade['tp']:
+                    tp_hit = True; exit_price = trade['tp']
                     
-            elif live_position == -1:
-                sl_price = live_entry_price * (1 + stop_pct)
-                tp_price = live_entry_price * (1 - profit_pct)
-                
-                # Check High for SL first
-                if current_h >= sl_price:
-                    sl_hit = True; exit_price = sl_price
-                # Check Low for TP
-                elif current_l <= tp_price:
-                    tp_hit = True; exit_price = tp_price
+            elif trade['type'] == -1:
+                if current_h >= trade['sl']:
+                    sl_hit = True; exit_price = trade['sl']
+                elif current_l <= trade['tp']:
+                    tp_hit = True; exit_price = trade['tp']
             
             if sl_hit or tp_hit:
-                if live_position == 1: pn_l = (exit_price - live_entry_price) / live_entry_price
-                else: pn_l = (live_entry_price - exit_price) / live_entry_price
+                if trade['type'] == 1: pn_l = (exit_price - trade['entry']) / trade['entry']
+                else: pn_l = (trade['entry'] - exit_price) / trade['entry']
                 
                 live_equity *= (1 + pn_l)
                 reason = "SL" if sl_hit else "TP"
                 live_trades.append({'time': ts, 'type': 'Exit', 'price': exit_price, 'pnl': pn_l, 'equity': live_equity, 'reason': reason})
-                live_position = 0
+                trades_exited = True
+            else:
+                remaining_live.append(trade)
                 
-                prev_close = current_c
-                with REPORT_LOCK:
-                    HTML_REPORTS[symbol] = generate_report(symbol, best_ind, train_df, test_df, train_curve, test_curve, test_trades, hourly_log, live_logs, live_trades)
-                continue
+        live_trades_active = remaining_live
+        
+        if trades_exited:
+            with REPORT_LOCK:
+                HTML_REPORTS[symbol] = generate_report(symbol, best_ind, train_df, test_df, train_curve, test_curve, test_trades, hourly_log, live_logs, live_trades)
 
-        if live_position == 0:
-            # === CHANGED: Use High/Low for Entry Detection ===
-            found_short = False
-            short_price = 0.0
-            
-            if current_h > prev_close:
-                idx_s = np.searchsorted(lines, prev_close, side='right')
-                idx_e = np.searchsorted(lines, current_h, side='right')
-                potential_shorts = lines[idx_s:idx_e]
-                if len(potential_shorts) > 0:
-                    found_short = True
-                    short_price = potential_shorts[0]
+        # --- Live Entry Logic (Multi-Trade) ---
+        found_short = False
+        short_price = 0.0
+        
+        if current_h > prev_close:
+            idx_s = np.searchsorted(lines, prev_close, side='right')
+            idx_e = np.searchsorted(lines, current_h, side='right')
+            potential_shorts = lines[idx_s:idx_e]
+            if len(potential_shorts) > 0:
+                found_short = True
+                short_price = potential_shorts[0]
 
-            found_long = False
-            long_price = 0.0
-            
-            if current_l < prev_close:
-                idx_s = np.searchsorted(lines, current_l, side='left')
-                idx_e = np.searchsorted(lines, prev_close, side='left')
-                potential_longs = lines[idx_s:idx_e]
-                if len(potential_longs) > 0:
-                    found_long = True
-                    long_price = potential_longs[-1]
+        found_long = False
+        long_price = 0.0
+        
+        if current_l < prev_close:
+            idx_s = np.searchsorted(lines, current_l, side='left')
+            idx_e = np.searchsorted(lines, prev_close, side='left')
+            potential_longs = lines[idx_s:idx_e]
+            if len(potential_longs) > 0:
+                found_long = True
+                long_price = potential_longs[-1]
 
-            target_line = 0.0
-            new_pos = 0
-            
-            if found_short and found_long:
-                if current_c > prev_close:
-                    new_pos = -1; target_line = short_price
-                else:
-                    new_pos = 1; target_line = long_price
-            elif found_short:
-                new_pos = -1; target_line = short_price
-            elif found_long:
-                new_pos = 1; target_line = long_price
-                
-            if new_pos != 0:
-                live_position = new_pos
-                live_entry_price = target_line
-                live_trades.append({'time': ts, 'type': 'Short' if live_position == -1 else 'Long', 'price': live_entry_price, 'pnl': 0, 'equity': live_equity, 'reason': 'Entry'})
+        trades_entered = False
+        
+        if found_short:
+            entry_price = short_price
+            live_trades_active.append({
+                'type': -1,
+                'entry': entry_price,
+                'sl': entry_price * (1 + stop_pct),
+                'tp': entry_price * (1 - profit_pct)
+            })
+            live_trades.append({'time': ts, 'type': 'Short', 'price': entry_price, 'pnl': 0, 'equity': live_equity, 'reason': 'Entry'})
+            trades_entered = True
+
+        if found_long:
+            entry_price = long_price
+            live_trades_active.append({
+                'type': 1,
+                'entry': entry_price,
+                'sl': entry_price * (1 - stop_pct),
+                'tp': entry_price * (1 + profit_pct)
+            })
+            live_trades.append({'time': ts, 'type': 'Long', 'price': entry_price, 'pnl': 0, 'equity': live_equity, 'reason': 'Entry'})
+            trades_entered = True
 
         prev_close = current_c
-        with REPORT_LOCK:
-            HTML_REPORTS[symbol] = generate_report(symbol, best_ind, train_df, test_df, train_curve, test_curve, test_trades, hourly_log, live_logs, live_trades)
+        
+        if trades_entered:
+            with REPORT_LOCK:
+                HTML_REPORTS[symbol] = generate_report(symbol, best_ind, train_df, test_df, train_curve, test_curve, test_trades, hourly_log, live_logs, live_trades)
+        
+        # Periodic update (every 5 mins) if nothing happens
+        if len(live_logs) % 5 == 0:
+             with REPORT_LOCK:
+                HTML_REPORTS[symbol] = generate_report(symbol, best_ind, train_df, test_df, train_curve, test_curve, test_trades, hourly_log, live_logs, live_trades)
 
 # --- 7. Server Handler ---
 class ResultsHandler(http.server.SimpleHTTPRequestHandler):
@@ -710,19 +683,8 @@ def process_asset(asset_config):
     }
 
     # 5. Final Tests
-    # Training curve (No Fees)
     train_curve, _, _ = run_backtest(train_df, best_ind[0], best_ind[1], np.array(best_ind[2:]), detailed_log_trades=0)
-    
-    # Test curve (WITH Fees 0.2% and Slippage 0.2% as requested)
-    test_curve, test_trades, hourly_log = run_backtest(
-        test_df, 
-        best_ind[0], 
-        best_ind[1], 
-        np.array(best_ind[2:]), 
-        detailed_log_trades=5,
-        fee_pct=0.002,
-        slippage_pct=0.002
-    )
+    test_curve, test_trades, hourly_log = run_backtest(test_df, best_ind[0], best_ind[1], np.array(best_ind[2:]), detailed_log_trades=5)
     
     # 6. Generate Initial Report
     with REPORT_LOCK:
